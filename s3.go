@@ -4,40 +4,35 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
-	"io/ioutil"
-	"os"
 	"path"
 	"strconv"
 	"strings"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/certmagic"
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
-	"go.uber.org/zap"
 )
 
 type S3 struct {
-	logger *zap.Logger
 
 	// S3
-	Client         *minio.Client
-	Host           string `json:"host"`
-	Bucket         string `json:"bucket"`
-	AccessID       string `json:"access_id"`
-	SecretKey      string `json:"secret_key"`
-	Prefix         string `json:"prefix"`
-	Insecure       bool   `json:"insecure"`
-	UseIamProvider bool   `json:"use_iam_provider"`
+	S3       s3iface.S3API
+	bucket   string `json:"bucket"`
+	prefix   string `json:"prefix"`
+	Insecure bool   `json:"insecure"`
 }
 
 func init() {
 	caddy.RegisterModule(S3{})
 }
 
-func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+func (s *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		var value string
 
@@ -48,28 +43,16 @@ func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		}
 
 		switch key {
-		case "host":
-			s3.Host = value
 		case "bucket":
-			s3.Bucket = value
-		case "access_id":
-			s3.AccessID = value
-		case "secret_key":
-			s3.SecretKey = value
+			s.bucket = value
 		case "prefix":
-			s3.Prefix = value
+			s.prefix = value
 		case "insecure":
 			insecure, err := strconv.ParseBool(value)
 			if err != nil {
 				return d.Err("Invalid usage of insecure in s3-storage config: " + err.Error())
 			}
-			s3.Insecure = insecure
-		case "use_iam_provider":
-			boolValue, err := strconv.ParseBool(value)
-			if err != nil {
-				return d.Err("Invalid usage of use_iam_provider in s3-storage config: " + err.Error())
-			}
-			s3.UseIamProvider = boolValue
+			s.Insecure = insecure
 		}
 
 	}
@@ -77,65 +60,13 @@ func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
-func (s3 *S3) Provision(ctx caddy.Context) error {
-	s3.logger = ctx.Logger(s3)
-
-	// Load Environment
-	if s3.Host == "" {
-		s3.Host = os.Getenv("S3_HOST")
-	}
-
-	if s3.Bucket == "" {
-		s3.Bucket = os.Getenv("S3_BUCKET")
-	}
-
-	if s3.AccessID == "" {
-		s3.AccessID = os.Getenv("S3_ACCESS_ID")
-	}
-
-	if s3.SecretKey == "" {
-		s3.SecretKey = os.Getenv("S3_SECRET_KEY")
-	}
-
-	if s3.Prefix == "" {
-		s3.Prefix = os.Getenv("S3_PREFIX")
-	}
-
-	if !s3.Insecure {
-		insecure := os.Getenv("S3_INSECURE")
-		if insecure != "" {
-			s3.Insecure, _ = strconv.ParseBool(insecure)
-		}
-	}
-	secure := !s3.Insecure
-
-	if !s3.UseIamProvider {
-		boolVal := os.Getenv("S3_USE_IAM_PROVIDER")
-		if boolVal != "" {
-			s3.UseIamProvider, _ = strconv.ParseBool(boolVal)
-		}
-	}
-
-	var creds *credentials.Credentials
-	if s3.UseIamProvider {
-		s3.logger.Info("use iam aws provider for credentials")
-		creds = credentials.NewIAM("")
-	} else {
-		s3.logger.Info("use secret_key and access_id for credentials")
-		creds = credentials.NewStaticV4(s3.AccessID, s3.SecretKey, "")
-	}
-
-	// S3 Client
-	client, err := minio.New(s3.Host, &minio.Options{
-		Creds:  creds,
-		Secure: secure,
-	})
-
+func (s *S3) Provision(ctx caddy.Context) error {
+	awsSession, err := session.NewSession()
 	if err != nil {
-		return err
-	} else {
-		s3.Client = client
+		return fmt.Errorf("creating s3 session: %w", err)
 	}
+
+	s.S3 = s3.New(awsSession)
 
 	return nil
 }
@@ -149,111 +80,106 @@ func (S3) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-func (s3 S3) CertMagicStorage() (certmagic.Storage, error) {
-	return s3, nil
+func (s S3) CertMagicStorage() (certmagic.Storage, error) {
+	return s, nil
 }
 
-func (s3 S3) Lock(ctx context.Context, key string) error {
+func (s S3) Lock(ctx context.Context, key string) error {
 	return nil
 }
 
-func (s3 S3) Unlock(ctx context.Context, key string) error {
+func (s S3) Unlock(ctx context.Context, key string) error {
 	return nil
 }
 
-func (s3 S3) Store(ctx context.Context, key string, value []byte) error {
-	key = s3.KeyPrefix(key)
+func (s S3) Store(ctx context.Context, key string, value []byte) error {
 	length := int64(len(value))
 
-	s3.logger.Debug(fmt.Sprintf("Store: %s, %d bytes", key, length))
-
-	_, err := s3.Client.PutObject(context.Background(), s3.Bucket, key, bytes.NewReader(value), length, minio.PutObjectOptions{})
+	_, err := s.S3.PutObjectWithContext(ctx, &s3.PutObjectInput{
+		Bucket:        &s.bucket,
+		Key:           aws.String(s.keyPrefix(key)),
+		Body:          bytes.NewReader(value),
+		ContentLength: &length,
+	})
 
 	return err
 }
 
-func (s3 S3) Load(ctx context.Context, key string) ([]byte, error) {
-	if !s3.Exists(ctx, key) {
+func (s S3) Load(ctx context.Context, key string) ([]byte, error) {
+	if !s.Exists(ctx, key) {
 		return nil, fs.ErrNotExist
 	}
 
-	key = s3.KeyPrefix(key)
-
-	s3.logger.Debug(fmt.Sprintf("Load key: %s", key))
-
-	object, err := s3.Client.GetObject(context.Background(), s3.Bucket, key, minio.GetObjectOptions{})
-
+	object, err := s.S3.GetObjectWithContext(ctx, &s3.GetObjectInput{
+		Bucket: &s.bucket,
+		Key:    aws.String(s.keyPrefix(key)),
+	})
 	if err != nil {
 		return nil, err
 	}
+	defer object.Body.Close()
 
-	return ioutil.ReadAll(object)
+	return io.ReadAll(object.Body)
 }
 
-func (s3 S3) Delete(ctx context.Context, key string) error {
-	key = s3.KeyPrefix(key)
+func (s S3) Delete(ctx context.Context, key string) error {
+	key = s.keyPrefix(key)
 
-	s3.logger.Debug(fmt.Sprintf("Delete key: %s", key))
-
-	return s3.Client.RemoveObject(context.Background(), s3.Bucket, key, minio.RemoveObjectOptions{})
+	_, err := s.S3.DeleteObjectWithContext(ctx, &s3.DeleteObjectInput{
+		Bucket: &s.bucket,
+		Key:    &key,
+	})
+	return err
 }
 
-func (s3 S3) Exists(ctx context.Context, key string) bool {
-	key = s3.KeyPrefix(key)
-
-	_, err := s3.Client.StatObject(context.Background(), s3.Bucket, key, minio.StatObjectOptions{})
+func (s S3) Exists(ctx context.Context, key string) bool {
+	_, err := s.Stat(ctx, key)
 
 	exists := err == nil
-
-	s3.logger.Debug(fmt.Sprintf("Check exists: %s, %t", key, exists))
-
 	return exists
 }
 
-func (s3 S3) List(ctx context.Context, prefix string, recursive bool) ([]string, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+func (s S3) List(ctx context.Context, prefix string, recursive bool) ([]string, error) {
+	keys := make([]string, 0, 32)
+	err := s.S3.ListObjectsPagesWithContext(ctx, &s3.ListObjectsInput{
+		Bucket: aws.String(s.bucket),
+		Prefix: &s.prefix,
+	}, func(objects *s3.ListObjectsOutput, b bool) bool {
+		for _, obj := range objects.Contents {
+			if obj == nil || obj.Key == nil {
+				continue
+			}
 
-	defer cancel()
-
-	objects := s3.Client.ListObjects(ctx, s3.Bucket, minio.ListObjectsOptions{
-		Prefix:    prefix,
-		Recursive: recursive,
+			keys = append(keys, *obj.Key)
+		}
+		return true
 	})
 
-	keys := make([]string, len(objects))
-
-	for object := range objects {
-		keys = append(keys, object.Key)
-	}
-
-	return keys, nil
+	return keys, err
 }
 
-func (s3 S3) Stat(ctx context.Context, key string) (certmagic.KeyInfo, error) {
-	key = s3.KeyPrefix(key)
-
-	object, err := s3.Client.StatObject(context.Background(), s3.Bucket, key, minio.StatObjectOptions{})
-
+func (s S3) Stat(ctx context.Context, key string) (certmagic.KeyInfo, error) {
+	keyWithPrefix := s.keyPrefix(key)
+	attrs, err := s.S3.GetObjectAttributes(&s3.GetObjectAttributesInput{
+		Bucket: &s.bucket,
+		Key:    aws.String(keyWithPrefix),
+	})
 	if err != nil {
-		s3.logger.Error(fmt.Sprintf("Stat key: %s, error: %v", key, err))
-
 		return certmagic.KeyInfo{}, nil
 	}
 
-	s3.logger.Debug(fmt.Sprintf("Stat key: %s, size: %d bytes", key, object.Size))
-
 	return certmagic.KeyInfo{
-		Key:        object.Key,
-		Modified:   object.LastModified,
-		Size:       object.Size,
-		IsTerminal: strings.HasSuffix(object.Key, "/"),
-	}, err
+		Key:        keyWithPrefix,
+		Modified:   *attrs.LastModified,
+		Size:       *attrs.ObjectSize,
+		IsTerminal: strings.HasSuffix(keyWithPrefix, "/"),
+	}, nil
 }
 
-func (s3 S3) KeyPrefix(key string) string {
-	return path.Join(s3.Prefix, key)
+func (s S3) keyPrefix(key string) string {
+	return path.Join(s.prefix, key)
 }
 
-func (s3 S3) String() string {
-	return fmt.Sprintf("S3 Storage Host: %s, Bucket: %s, Prefix: %s", s3.Host, s3.Bucket, s3.Prefix)
+func (s S3) String() string {
+	return fmt.Sprintf("S3 Storage Bucket: %s, Prefix: %s", s.bucket, s.prefix)
 }
