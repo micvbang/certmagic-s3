@@ -1,81 +1,59 @@
-## CertMagic-S3
+# CertMagic-S3
 
 CertMagic S3-compatible driver written in Go.
 
-### Guide
+The driver utilizes the github.com/aws/aws-sdk-go/aws package to access the S3 API. Configuration of AWS credentials follows [AWS's standard environment variables, configuration files etc.](https://docs.aws.amazon.com/sdkref/latest/guide/creds-config-files.html). The precedence is [described here](https://docs.aws.amazon.com/sdk-for-go/api/aws/session/#hdr-Credential_and_config_loading_order).
+
+## Build and run
 
 Build
 
-    go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+```bash
+go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
-    xcaddy build --output ./caddy --with github.com/ss098/certmagic-s3
+xcaddy build --output ./caddy --with github.com/micvbang/certmagic-s3
+```
 
 Build container
 
-    FROM caddy:builder AS builder
-    RUN xcaddy build --with github.com/ss098/certmagic-s3 --with ...
+```Dockerfile
+FROM caddy:builder AS builder
+RUN xcaddy build --with github.com/micvbang/certmagic-s3 --with ...
 
-    FROM caddy
-    COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+FROM caddy
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+```
 
 Run
 
-    caddy run --config caddy.json
+```bash
+caddy run --config caddy.json
+```
+
+## Configuration
 
 Caddyfile Example
 
-    # Global Config
-
-    {
-        storage s3 {
-            host "Host"
-            bucket "Bucket"
-            access_id "Access ID"
-            secret_key "Secret Key"
-            prefix "ssl"
-            insecure false #disables SSL if true
-        }
+```json
+{
+    storage s3 {
+        bucket "Bucket"
     }
+}
+```
 
 JSON Config Example
 
-    {
-      "storage": {
-        "module": "s3",
-        "host": "Host",
+```json
+{
+    "storage": {
         "bucket": "Bucket",
-        "access_id": "Access ID",
-        "secret_key": "Secret Key",
-        "prefix": "ssl",
-        "insecure": false
-      }
-      "app": {
-        ...
-      }
     }
+}
+```
 
 From Environment
 
-    S3_HOST
-    S3_BUCKET
-    S3_ACCESS_ID
-    S3_SECRET_KEY
-    S3_PREFIX
-    S3_INSECURE
-
-
-AWS IAM Provider Example
-
-Caddyfile Example
-
-    # Global Config
-
-    {
-        storage s3 {
-            host "Host"
-            bucket "Bucket"
-            use_iam_provider true
-            prefix "ssl"
-            insecure false #disables SSL if true
-        }
-    }
+```bash
+export S3_CERTIFICATE_BUCKET="bucket-name"
+```
